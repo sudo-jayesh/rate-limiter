@@ -187,16 +187,22 @@ decrease) and Netflix's concurrency-limits are the common formulations.
 Go, in-memory, functions only — no methods, no interfaces, no server. Each algorithm is one
 file plus its test file.
 
-| Algorithm | File | Status |
+| Algorithm | File | Entry point |
 |---|---|---|
-| Fixed Window | `fixedwindow.go` | done |
-| Sliding Window Log | `slidingwindowlog.go` | todo |
-| Sliding Window Counter | `slidingwindowcounter.go` | todo |
-| Token Bucket | `tokenbucket.go` | todo |
-| Leaky Bucket | `leakybucket.go` | todo |
-| GCRA | `gcra.go` | todo |
-| Concurrency | `concurrency.go` | todo |
-| Adaptive (AIMD) | `adaptive.go` | todo |
+| Fixed Window | `fixedwindow.go` | `AllowFixedWindow` |
+| Sliding Window Log | `slidingwindowlog.go` | `AllowSlidingWindowLog` |
+| Sliding Window Counter | `slidingwindowcounter.go` | `AllowSlidingWindowCounter` |
+| Token Bucket | `tokenbucket.go` | `AllowTokenBucket`, `AllowTokenBucketN` |
+| Leaky Bucket | `leakybucket.go` | `AllowLeakyBucket` |
+| GCRA | `gcra.go` | `AllowGCRA` |
+| Concurrency | `concurrency.go` | `AcquireConcurrency` / `ReleaseConcurrency` |
+| Adaptive (AIMD) | `adaptive.go` | `AcquireAdaptive` / `ReleaseAdaptive` |
+
+The six rate-based algorithms also have a `Limiter` constructor in `limiter.go`
+(`FixedWindow`, `TokenBucket`, `GCRA`, …) that closes over the state and returns a
+`func(key, now) Decision`. That common type is what lets one conformance suite and one
+benchmark cover all six. Concurrency and adaptive have no constructor — both need a release
+call to return a slot, which an `Allow`-shaped function can't express.
 
 ### Conventions
 
@@ -221,13 +227,64 @@ n     := PruneXxx(state, now)                    // drops keys that can no longe
 - **Concurrency limiters break the shape** — they need `AcquireXxx`/`ReleaseXxx` rather than
   a single `Allow`, because the release is what frees the slot.
 
-Tests use a clock offset from a window-aligned constant, cover the algorithm's known
+Tests use a clock offset from a window-aligned constant, cover each algorithm's known
 weakness explicitly (see `TestAllowFixedWindowBoundaryBurst`), and include a `-race` case
 asserting the total admitted under concurrency is exactly the limit.
 
 ```bash
 go test -race ./...
 ```
+
+`limiter_test.go` additionally runs every rate-based algorithm through the same properties —
+the useful one being `TestLimiterRetryAfterIsHonest`: a client that waits exactly the
+advertised `RetryAfter` must then be admitted. Each algorithm derives that hint by a
+completely different route, and it caught two real bugs that per-algorithm tests missed:
+
+- The sliding window counter pointed at the rollover instant, where the current window's
+  count has just become the previous window's at full weight — so the estimate hadn't moved
+  and the retry was rejected again.
+- Token and leaky buckets truncated the refill duration to the nanosecond below, leaving the
+  bucket a fraction short at rates that don't divide evenly into a second. `TokenBucket(5, 3)`
+  advertised 333.333333ms and needed 333.333334ms.
+
+Both are the same failure in the end: a hint short by one nanosecond costs every rejected
+client a wasted round trip. The suite carries deliberate uneven-rate cases so they can't
+return.
+
+### Measured cost
+
+`go test -bench . -benchtime 300000x`, Apple M-series, ns/op, zero allocations on every path:
+
+| Algorithm | Hot key | 10k keys |
+|---|---|---|
+| GCRA | 10.4 | 18.8 |
+| Sliding Window Log | 10.9 | 20.2 |
+| Leaky Bucket | 21.1 | 27.6 |
+| Sliding Window Counter | 22.9 | 27.0 |
+| Token Bucket | 23.5 | 40.2 |
+| Fixed Window | 23–32 (noisy) | 26.2 |
+
+GCRA being fastest is the theory holding up: one `int64` per key and pure integer arithmetic,
+no floats and no allocation. Two caveats on reading this table — the hot-key column saturates
+after the first few iterations, so it mostly measures the *rejection* path, and every figure
+is single-goroutine, so none of it reflects lock contention.
+
+### Known limitations
+
+Deliberate, so the algorithms stay readable. Each would be the right thing to fix first if
+this were going in front of real traffic:
+
+- **One mutex per limiter, covering every key.** Two unrelated keys contend. The fix is
+  sharding the map into N `{mutex, map}` pairs selected by a hash of the key, which divides
+  contention by N — but does nothing for a single hot key.
+- **Key spaces are unbounded and pruning is caller-driven.** Nothing calls `PruneXxx`. Keyed
+  by IP, a million distinct source addresses means a million map entries, so the limiter
+  becomes the memory-exhaustion vector it was meant to prevent. A bounded LRU is the real
+  answer; periodic pruning walks the whole map under the lock.
+- **No cost/weight parameter** except on the token bucket (`AllowTokenBucketN`).
+- **Wall-clock, not monotonic.** Windows align to the epoch via `UnixNano`, so an NTP
+  step shifts them. The buckets tolerate time moving backwards without losing state; the
+  windows would shift.
 
 ## Distributed considerations
 
